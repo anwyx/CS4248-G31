@@ -1,0 +1,48 @@
+model_name: "Robertp423/Qwen3-VL-4B-Construct"
+fallback_model_name: "Qwen/Qwen3-VL-4B-Instruct"
+model_output_dir: "outputs/stage_a_model"
+device_map: "auto"
+dtype: "bfloat16"
+freeze_backbone: true
+use_lora: true
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules:
+  - "q_proj"
+  - "k_proj"
+  - "v_proj"
+  - "o_proj"
+  - "gate_proj"
+  - "up_proj"
+  - "down_proj"
+classifier_dropout: 0.1
+max_candidates: 5
+use_grounding: true
+grounding_backend: "grounding_dino"
+grounding_model_name: "IDEA-Research/grounding-dino-base"
+grounding_fallback_model_name: "yolo_world/l"
+grounding_box_threshold: 0.30
+grounding_text_threshold: 0.25
+grounding_crop_dir: "outputs/grounding_crops"
+topk_targets: 3
+confidence_threshold: 0.35
+drop_unlabeled_candidates: false
+loss_type: "cross_entropy"
+class_weighting: false
+train_jsonl: ""
+val_jsonl: ""
+test_jsonl: ""
+train_split_ratio: 0.8
+eval_split_ratio: 0.1
+train_batch_size: 2
+eval_batch_size: 2
+grad_accum_steps: 8
+learning_rate: 0.0002
+num_epochs: 5
+weight_decay: 0.01
+patience: 2
+seed: 42
+save_top_confusion_classes: 20
+use_crop_text_hint: true
+use_full_image_only: true

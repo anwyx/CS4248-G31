@@ -1,0 +1,5 @@
+spacy_model: "en_core_web_sm"
+target_vocab_path: "outputs/stage_a_model/target_vocab.json"
+stage_a_output_path: "outputs/stage_a_predictions.jsonl"
+stage_b_output_path: "outputs/stage_b_predictions.jsonl"
+cache_dir: "outputs/cache"
