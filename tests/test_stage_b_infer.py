@@ -7,10 +7,19 @@ def test_stage_b_candidate_generation_returns_non_empty_candidate():
     generator = StageBGenerator(model)
     sample = {
         "image_path": "dummy.jpg",
-        "title": "When work piles up",
+        "title": "He did it",
         "ocr_text": "",
-        "literal_caption": "a cat at a desk",
+        "img_captions": [
+            "A woman shows off her engagement ring which Thor approves of.",
+            "A couple poses in the top left picture.",
+        ],
     }
-    candidates = generator.generate_candidates(sample, target_concepts=["confused person"], vehicle_blacklist=["cat"], k=2)
+    candidates = generator.generate_candidates(
+        sample,
+        target_concepts=["meme poster"],
+        metaphor_mappings=[("woman", "meme poster")],
+        vehicle_blacklist=["woman"],
+        k=2,
+    )
     assert candidates
     assert any(candidate.strip() for candidate in candidates)

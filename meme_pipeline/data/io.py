@@ -52,10 +52,49 @@ def read_jsonl(
     return items
 
 
-def load_raw_samples(path: str | Path) -> list[RawMemeSample]:
-    """Load validated raw meme samples."""
+def resolve_image_path(
+    sample: RawMemeSample,
+    *,
+    image_root_dir: str | Path | None = None,
+    fail_on_missing_image: bool = True,
+) -> str:
+    """Resolve image path from `image_root_dir` and `img_fname`."""
 
-    return [item for item in read_jsonl(path, parser=RawMemeSample.model_validate)]
+    if image_root_dir:
+        image_path = Path(image_root_dir) / sample.img_fname
+    elif sample.image_path:
+        image_path = Path(sample.image_path)
+    else:
+        raise ValueError(
+            f"Cannot derive image_path for sample {sample.post_id}. "
+            "Provide image_root_dir and img_fname, or include image_path."
+        )
+    if fail_on_missing_image and not image_path.exists():
+        raise FileNotFoundError(
+            f"Image file not found for sample {sample.post_id}: {image_path}. "
+            "Check image_root_dir and img_fname."
+        )
+    return str(image_path)
+
+
+def load_raw_samples(
+    path: str | Path,
+    *,
+    image_root_dir: str | Path | None = None,
+    fail_on_missing_image: bool = True,
+) -> list[RawMemeSample]:
+    """Load validated raw meme samples and derive image paths."""
+
+    items = [item for item in read_jsonl(path, parser=RawMemeSample.model_validate)]
+    samples: list[RawMemeSample] = []
+    for item in items:
+        image_path = resolve_image_path(
+            item,
+            image_root_dir=image_root_dir,
+            fail_on_missing_image=fail_on_missing_image,
+        )
+        samples.append(item.model_copy(update={"image_path": image_path}))
+    return samples
 
 
 def write_jsonl(path: str | Path, records: Iterable[Any]) -> None:

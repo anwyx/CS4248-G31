@@ -13,12 +13,12 @@ def test_stage_a_forward_returns_expected_shape():
     )
     batch = {
         "image_path": ["image_1.jpg", "image_2.jpg"],
-        "title": ["title", "title"],
+        "title": ["He did it", "He did it"],
         "ocr_text": ["", ""],
-        "literal_caption": ["cat on chair", "dog near desk"],
-        "vehicle_surface": ["cat", "dog"],
-        "vehicle_normalized": ["cat", "dog"],
-        "vehicle_head": ["cat", "dog"],
+        "img_captions": [["A woman shows a ring."], ["A man looks proud."]],
+        "vehicle_surface": ["A woman", "A man"],
+        "vehicle_normalized": ["woman", "man"],
+        "vehicle_head": ["woman", "man"],
         "bbox_xyxy": [None, None],
     }
     logits = model(batch)

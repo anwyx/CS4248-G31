@@ -43,14 +43,17 @@ def rank_or_filter_candidates(
     candidates: list[dict[str, Any]],
     title: str,
     ocr_text: str,
-    literal_caption: str,
+    image_captions: list[str] | str,
     max_candidates: int = 5,
 ) -> list[dict[str, Any]]:
     """Rank candidate vehicles using lightweight salience heuristics."""
 
     title_norm = normalize_case(title)
     ocr_norm = normalize_case(ocr_text)
-    caption_norm = normalize_case(literal_caption)
+    if isinstance(image_captions, str):
+        caption_norm = normalize_case(image_captions)
+    else:
+        caption_norm = normalize_case(" ".join(image_captions))
     ranked: list[tuple[float, dict[str, Any]]] = []
     for index, candidate in enumerate(candidates):
         score = 0.0

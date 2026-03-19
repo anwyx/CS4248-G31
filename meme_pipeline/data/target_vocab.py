@@ -38,19 +38,22 @@ def build_target_vocab(
     *,
     min_freq: int = 1,
     nlp=None,
+    image_root_dir: str | Path | None = None,
 ) -> TargetVocab:
-    """Build target vocabulary from gold Stage A labels."""
+    """Build target vocabulary from gold Stage A target meanings."""
 
     counter: Counter[str] = Counter()
-    for sample in load_raw_samples(train_jsonl):
-        for pair in sample.vehicle_target_pairs or []:
-            normalized = canonicalize_phrase(pair.target, nlp) if nlp is not None else pair.target.lower().strip()
+    for sample in load_raw_samples(train_jsonl, image_root_dir=image_root_dir, fail_on_missing_image=False):
+        for pair in sample.metaphors or []:
+            normalized = canonicalize_phrase(pair.meaning, nlp) if nlp is not None else pair.meaning.lower().strip()
             if normalized:
                 counter[normalized] += 1
     stoi = {"OTHER": 0, "NO_TARGET": 1}
     for label, freq in sorted(counter.items()):
         if freq >= min_freq and label not in stoi:
             stoi[label] = len(stoi)
+    if len(stoi) <= 2:
+        raise ValueError("No valid Stage A target labels found in metaphors[].meaning. Check the training JSONL.")
     LOGGER.info("Built target vocab with %s labels", len(stoi))
     return TargetVocab(stoi)
 

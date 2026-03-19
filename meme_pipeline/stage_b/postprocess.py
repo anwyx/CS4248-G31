@@ -37,14 +37,23 @@ def _target_overlap_score(text: str, targets: Sequence[str]) -> float:
     return len(target_tokens & text_tokens) / len(target_tokens)
 
 
-def _semantic_similarity_proxy(text: str, targets: Sequence[str]) -> float:
-    joined_targets = ", ".join(targets)
+def _mapping_overlap_score(text: str, mappings: Sequence[tuple[str, str]]) -> float:
+    target_side = [mapping[1] for mapping in mappings if len(mapping) == 2]
+    return _target_overlap_score(text, target_side)
+
+
+def _semantic_similarity_proxy(text: str, reference_text: str) -> float:
+    if not reference_text.strip():
+        return 0.0
     try:
         from sentence_transformers import SentenceTransformer, util
     except ImportError:
-        return _target_overlap_score(text, targets)
-    model = _load_sentence_transformer()
-    embeddings = model.encode([text, joined_targets], convert_to_tensor=True)
+        return _copy_fraction(text, reference_text)
+    try:
+        model = _load_sentence_transformer()
+    except Exception:
+        return _copy_fraction(text, reference_text)
+    embeddings = model.encode([text, reference_text], convert_to_tensor=True)
     return float(util.cos_sim(embeddings[0], embeddings[1]).item())
 
 
@@ -52,7 +61,7 @@ def _semantic_similarity_proxy(text: str, targets: Sequence[str]) -> float:
 def _load_sentence_transformer():
     from sentence_transformers import SentenceTransformer
 
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", local_files_only=True)
 
 
 @dataclass
@@ -68,7 +77,7 @@ def clean_generation_text(text: str) -> str:
     """Strip prompt leakage and boilerplate."""
 
     cleaned = text.strip()
-    for marker in ["Predicted target concepts", "Task:", "Expected output style:", "User:", "System:"]:
+    for marker in ["Predicted metaphor mappings", "Predicted target concepts", "Task:", "Expected output style:", "User:", "System:"]:
         if marker in cleaned:
             cleaned = cleaned.split(marker, maxsplit=1)[0].strip()
     cleaned = cleaned.replace("\n", " ").strip(" -")
@@ -87,7 +96,7 @@ def is_valid_candidate(
     cleaned = clean_generation_text(text)
     if len(cleaned.split()) < 3:
         return False
-    if cleaned.lower().startswith("predicted target concepts"):
+    if cleaned.lower().startswith("predicted metaphor mappings"):
         return False
     if _copy_fraction(cleaned, title) > 0.8 and len(title.split()) >= 3:
         return False
@@ -112,16 +121,20 @@ def dedupe_candidates(candidates: Sequence[str]) -> list[str]:
 def rerank_candidates(
     candidates: Sequence[str],
     *,
+    mappings: Sequence[tuple[str, str]],
     targets: Sequence[str],
     title: str,
     ocr_text: str,
+    image_captions: Sequence[str],
     vehicle_terms: Sequence[str],
     vehicle_penalty_weight: float,
     ocr_penalty_weight: float,
     title_penalty_weight: float,
 ) -> list[CandidateScore]:
-    """Score candidate captions with penalties and target relevance."""
+    """Score candidate captions with mapping relevance and copy penalties."""
 
+    mapping_reference = " ; ".join(f"{vehicle} -> {target}" for vehicle, target in mappings)
+    caption_reference = " ".join(image_captions)
     scored: list[CandidateScore] = []
     for candidate in dedupe_candidates(candidates):
         length = len(candidate.split())
@@ -129,14 +142,18 @@ def rerank_candidates(
         vehicle_penalty = _forbidden_term_fraction(candidate, vehicle_terms)
         ocr_penalty = _copy_fraction(candidate, ocr_text)
         title_penalty = _copy_fraction(candidate, title)
+        caption_copy_penalty = _copy_fraction(candidate, caption_reference)
         target_coverage = _target_overlap_score(candidate, targets)
-        semantic_similarity = _semantic_similarity_proxy(candidate, targets) if targets else 0.0
+        mapping_coverage = _mapping_overlap_score(candidate, mappings)
+        semantic_similarity = _semantic_similarity_proxy(candidate, mapping_reference or ", ".join(targets))
         score = (
             target_coverage
+            + mapping_coverage
             + semantic_similarity
             - vehicle_penalty_weight * vehicle_penalty
             - ocr_penalty_weight * ocr_penalty
             - title_penalty_weight * title_penalty
+            - 0.25 * caption_copy_penalty
             - 0.3 * verbosity_penalty
         )
         scored.append(
@@ -147,6 +164,7 @@ def rerank_candidates(
                     "vehicle_copy": float(vehicle_penalty),
                     "ocr_copy": float(ocr_penalty),
                     "title_copy": float(title_penalty),
+                    "caption_copy": float(caption_copy_penalty),
                     "verbosity": float(verbosity_penalty),
                 },
             )

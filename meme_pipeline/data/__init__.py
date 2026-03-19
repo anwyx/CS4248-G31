@@ -2,18 +2,18 @@
 
 from .schemas import (
     CandidateVehicle,
+    MetaphorPair,
     RawMemeSample,
     StageAInferenceRecord,
     StageAInstance,
     StageBInferenceRecord,
-    VehicleTargetPair,
 )
 
 __all__ = [
     "CandidateVehicle",
+    "MetaphorPair",
     "RawMemeSample",
     "StageAInferenceRecord",
     "StageAInstance",
     "StageBInferenceRecord",
-    "VehicleTargetPair",
 ]

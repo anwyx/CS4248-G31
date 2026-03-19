@@ -1,8 +1,8 @@
-"""Vehicle extraction from literal image captions."""
+"""Vehicle extraction from image captions."""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 from meme_pipeline.utils.text_norm import canonicalize_phrase
 
@@ -33,7 +33,7 @@ def load_spacy_or_fail(model_name: str = "en_core_web_sm"):
         ) from exc
 
 
-def _make_candidate(span: Any, nlp) -> dict[str, Any] | None:
+def _make_candidate(span: Any, nlp, caption_index: int) -> dict[str, Any] | None:
     surface = span.text.strip()
     normalized = canonicalize_phrase(surface, nlp)
     if not normalized or normalized in JUNK_PHRASES:
@@ -43,6 +43,7 @@ def _make_candidate(span: Any, nlp) -> dict[str, Any] | None:
         return None
     head = canonicalize_phrase(getattr(span.root, "text", surface), nlp) or normalized.split()[-1]
     return {
+        "caption_index": caption_index,
         "surface": surface,
         "normalized": normalized,
         "head": head,
@@ -52,17 +53,17 @@ def _make_candidate(span: Any, nlp) -> dict[str, Any] | None:
     }
 
 
-def extract_vehicle_candidates(literal_caption: str, nlp) -> list[dict[str, Any]]:
-    """Extract noun-phrase vehicle candidates from literal caption."""
+def extract_vehicle_candidates(caption_text: str, nlp, *, caption_index: int = 0) -> list[dict[str, Any]]:
+    """Extract noun-phrase vehicle candidates from a single image caption."""
 
-    if not literal_caption.strip():
+    if not caption_text.strip():
         return []
-    doc = nlp(literal_caption)
+    doc = nlp(caption_text)
     seen: set[str] = set()
     candidates: list[dict[str, Any]] = []
     noun_chunks = list(getattr(doc, "noun_chunks", []))
     for chunk in noun_chunks:
-        candidate = _make_candidate(chunk, nlp)
+        candidate = _make_candidate(chunk, nlp, caption_index)
         if candidate is None or candidate["normalized"] in seen:
             continue
         seen.add(candidate["normalized"])
@@ -80,6 +81,7 @@ def extract_vehicle_candidates(literal_caption: str, nlp) -> list[dict[str, Any]
         seen.add(normalized)
         candidates.append(
             {
+                "caption_index": caption_index,
                 "surface": token.text,
                 "normalized": normalized,
                 "head": normalized,
@@ -89,3 +91,20 @@ def extract_vehicle_candidates(literal_caption: str, nlp) -> list[dict[str, Any]
             }
         )
     return sorted(candidates, key=lambda item: item["start_char"])
+
+
+def extract_vehicle_candidates_from_captions(
+    img_captions: Sequence[str],
+    nlp,
+) -> list[dict[str, Any]]:
+    """Extract and deduplicate candidates across all image captions."""
+
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for caption_index, caption_text in enumerate(img_captions):
+        for candidate in extract_vehicle_candidates(caption_text, nlp, caption_index=caption_index):
+            if candidate["normalized"] in seen:
+                continue
+            seen.add(candidate["normalized"])
+            merged.append(candidate)
+    return sorted(merged, key=lambda item: (item["caption_index"], item["start_char"]))

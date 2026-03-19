@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from PIL import Image
 
@@ -7,27 +6,25 @@ from meme_pipeline.stage_a.infer import StageAInferencePipeline
 from meme_pipeline.stage_a.model import DummyVisionLanguageBackbone
 
 
-class DummySample:
-    def __init__(self, path: str) -> None:
-        self.id = "sample_1"
-        self.image_path = path
-        self.title = "When work piles up"
-        self.ocr_text = ""
-        self.literal_caption = "a confused cat at a desk"
-
-
-def test_stage_a_inference_writes_jsonl(tmp_path, monkeypatch):
-    image_path = tmp_path / "img.jpg"
+def test_stage_a_inference_writes_jsonl(tmp_path):
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+    image_path = image_root / "memes_d079np.png"
     Image.new("RGB", (16, 16), color="white").save(image_path)
     data_path = tmp_path / "input.jsonl"
     data_path.write_text(
         json.dumps(
             {
-                "id": "sample_1",
-                "image_path": str(image_path),
-                "title": "When work piles up",
-                "ocr_text": "",
-                "literal_caption": "a confused cat at a desk",
+                "category": "memes",
+                "img_captions": [
+                    "A woman shows off her engagement ring which Thor approves of.",
+                    "A couple poses in the top left picture.",
+                ],
+                "meme_captions": ["The meme expresses feeling proud and validated."],
+                "title": "He did it",
+                "img_fname": "memes_d079np.png",
+                "metaphors": [{"metaphor": "A woman", "meaning": "Meme poster"}],
+                "post_id": "d079np",
             }
         )
         + "\n",
@@ -35,7 +32,10 @@ def test_stage_a_inference_writes_jsonl(tmp_path, monkeypatch):
     )
     vocab_dir = tmp_path / "model"
     vocab_dir.mkdir()
-    (vocab_dir / "target_vocab.json").write_text('{"stoi":{"OTHER":0,"NO_TARGET":1,"confused person":2},"itos":{"0":"OTHER","1":"NO_TARGET","2":"confused person"}}')
+    (vocab_dir / "target_vocab.json").write_text(
+        '{"stoi":{"OTHER":0,"NO_TARGET":1,"meme poster":2},"itos":{"0":"OTHER","1":"NO_TARGET","2":"meme poster"}}',
+        encoding="utf-8",
+    )
 
     class DummyPipeline(StageAInferencePipeline):
         def __init__(self, config):
@@ -55,11 +55,17 @@ def test_stage_a_inference_writes_jsonl(tmp_path, monkeypatch):
                 hidden_size=16,
             )
 
-    pipeline = DummyPipeline({"model_output_dir": str(vocab_dir), "target_vocab_path": str(vocab_dir / "target_vocab.json")})
+    pipeline = DummyPipeline(
+        {
+            "model_output_dir": str(vocab_dir),
+            "target_vocab_path": str(vocab_dir / "target_vocab.json"),
+            "image_root_dir": str(image_root),
+        }
+    )
     output_path = tmp_path / "out.jsonl"
     pipeline.predict_jsonl(str(data_path), str(output_path))
     lines = output_path.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
     payload = json.loads(lines[0])
-    assert payload["id"] == "sample_1"
-    assert "vehicles" in payload
+    assert payload["id"] == "d079np"
+    assert "metaphor_mappings" in payload

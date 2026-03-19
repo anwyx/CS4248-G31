@@ -46,74 +46,100 @@ def _ngrams(tokens: list[str], n: int) -> list[tuple[str, ...]]:
     return [tuple(tokens[index : index + n]) for index in range(len(tokens) - n + 1)]
 
 
-def bleu4(references: Sequence[str], hypotheses: Sequence[str]) -> float:
-    """Compute a lightweight corpus BLEU-4."""
+def _normalize_references(references: Sequence[str] | Sequence[Sequence[str]]) -> list[list[str]]:
+    if not references:
+        return []
+    if isinstance(references[0], str):  # type: ignore[index]
+        return [[str(item)] for item in references]  # type: ignore[list-item]
+    return [[str(item) for item in group if str(item).strip()] for group in references]  # type: ignore[list-item]
 
-    if not references or not hypotheses:
-        return 0.0
+
+def _best_reference(reference_group: Sequence[str], hypothesis: str, scorer) -> float:
+    return max((scorer(reference, hypothesis) for reference in reference_group), default=0.0)
+
+
+def _sentence_bleu(reference: str, hypothesis: str) -> float:
     precisions: list[float] = []
-    hyp_len = 0
-    ref_len = 0
+    ref_tokens = normalize_case(reference).split()
+    hyp_tokens = normalize_case(hypothesis).split()
+    if not ref_tokens or not hyp_tokens:
+        return 0.0
     for n in range(1, 5):
-        matches = 0
-        total = 0
-        for ref, hyp in zip(references, hypotheses):
-            ref_tokens = normalize_case(ref).split()
-            hyp_tokens = normalize_case(hyp).split()
-            hyp_len += len(hyp_tokens) if n == 1 else 0
-            ref_len += len(ref_tokens) if n == 1 else 0
-            ref_counts = Counter(_ngrams(ref_tokens, n))
-            hyp_counts = Counter(_ngrams(hyp_tokens, n))
-            matches += sum(min(count, ref_counts[gram]) for gram, count in hyp_counts.items())
-            total += max(sum(hyp_counts.values()), 1)
+        ref_counts = Counter(_ngrams(ref_tokens, n))
+        hyp_counts = Counter(_ngrams(hyp_tokens, n))
+        total = max(sum(hyp_counts.values()), 1)
+        matches = sum(min(count, ref_counts[gram]) for gram, count in hyp_counts.items())
         precisions.append(matches / total if total else 0.0)
     if min(precisions) == 0:
         return 0.0
-    brevity_penalty = 1.0 if hyp_len > ref_len else math.exp(1 - ref_len / max(hyp_len, 1))
+    brevity_penalty = 1.0 if len(hyp_tokens) > len(ref_tokens) else math.exp(1 - len(ref_tokens) / max(len(hyp_tokens), 1))
     return brevity_penalty * math.exp(sum(math.log(p) for p in precisions) / 4)
 
 
-def rouge_l(references: Sequence[str], hypotheses: Sequence[str]) -> float:
-    """Compute average ROUGE-L F score."""
+def bleu4(references: Sequence[str] | Sequence[Sequence[str]], hypotheses: Sequence[str]) -> float:
+    """Compute BLEU-4 with single-reference or multi-reference support."""
 
-    def lcs_length(a: list[str], b: list[str]) -> int:
-        table = [[0] * (len(b) + 1) for _ in range(len(a) + 1)]
-        for i, token_a in enumerate(a, start=1):
-            for j, token_b in enumerate(b, start=1):
-                if token_a == token_b:
-                    table[i][j] = table[i - 1][j - 1] + 1
-                else:
-                    table[i][j] = max(table[i - 1][j], table[i][j - 1])
-        return table[-1][-1]
-
-    scores: list[float] = []
-    for ref, hyp in zip(references, hypotheses):
-        ref_tokens = normalize_case(ref).split()
-        hyp_tokens = normalize_case(hyp).split()
-        if not ref_tokens or not hyp_tokens:
-            scores.append(0.0)
-            continue
-        lcs = lcs_length(ref_tokens, hyp_tokens)
-        precision = lcs / len(hyp_tokens)
-        recall = lcs / len(ref_tokens)
-        if precision + recall == 0:
-            scores.append(0.0)
-        else:
-            scores.append(2 * precision * recall / (precision + recall))
+    normalized_references = _normalize_references(references)
+    if not normalized_references or not hypotheses:
+        return 0.0
+    scores = [
+        _best_reference(reference_group, hypothesis, _sentence_bleu)
+        for reference_group, hypothesis in zip(normalized_references, hypotheses)
+    ]
     return float(np.mean(scores)) if scores else 0.0
 
 
-def bertscore(references: Sequence[str], hypotheses: Sequence[str]) -> float | None:
-    """Compute BERTScore if the optional dependency is installed."""
+def _rouge_l_single(reference: str, hypothesis: str) -> float:
+    ref_tokens = normalize_case(reference).split()
+    hyp_tokens = normalize_case(hypothesis).split()
+    if not ref_tokens or not hyp_tokens:
+        return 0.0
+    table = [[0] * (len(hyp_tokens) + 1) for _ in range(len(ref_tokens) + 1)]
+    for i, token_a in enumerate(ref_tokens, start=1):
+        for j, token_b in enumerate(hyp_tokens, start=1):
+            if token_a == token_b:
+                table[i][j] = table[i - 1][j - 1] + 1
+            else:
+                table[i][j] = max(table[i - 1][j], table[i][j - 1])
+    lcs = table[-1][-1]
+    precision = lcs / len(hyp_tokens)
+    recall = lcs / len(ref_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def rouge_l(references: Sequence[str] | Sequence[Sequence[str]], hypotheses: Sequence[str]) -> float:
+    """Compute ROUGE-L using the best score over each reference set."""
+
+    normalized_references = _normalize_references(references)
+    if not normalized_references or not hypotheses:
+        return 0.0
+    scores = [
+        _best_reference(reference_group, hypothesis, _rouge_l_single)
+        for reference_group, hypothesis in zip(normalized_references, hypotheses)
+    ]
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def bertscore(references: Sequence[str] | Sequence[Sequence[str]], hypotheses: Sequence[str]) -> float | None:
+    """Compute optional BERTScore using the max F1 over each reference set."""
 
     try:
         from bert_score import score
     except ImportError:
         return None
-    if not references or not hypotheses:
+    normalized_references = _normalize_references(references)
+    if not normalized_references or not hypotheses:
         return 0.0
-    _, _, f1 = score(list(hypotheses), list(references), lang="en", verbose=False)
-    return float(f1.mean().item())
+    scores: list[float] = []
+    for reference_group, hypothesis in zip(normalized_references, hypotheses):
+        best = 0.0
+        for reference in reference_group:
+            _, _, f1 = score([hypothesis], [reference], lang="en", verbose=False)
+            best = max(best, float(f1.mean().item()))
+        scores.append(best)
+    return float(np.mean(scores)) if scores else 0.0
 
 
 def distinct_n(texts: Sequence[str], n: int) -> float:

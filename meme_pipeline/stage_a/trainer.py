@@ -14,7 +14,8 @@ from torch.utils.data import DataLoader
 
 from meme_pipeline.data.collators import simple_dict_collator
 from meme_pipeline.data.io import deterministic_split, load_config, load_raw_samples
-from meme_pipeline.data.target_vocab import TargetVocab, build_target_vocab, save_target_vocab
+from meme_pipeline.data.target_vocab import build_target_vocab, save_target_vocab
+from meme_pipeline.grounding.factory import load_grounder
 from meme_pipeline.stage_a.dataset import StageADataset, StageADatasetConfig
 from meme_pipeline.stage_a.model import StageAMetaphorClassifier, StageAModelConfig
 from meme_pipeline.stage_a.vehicle_extractor import load_spacy_or_fail
@@ -30,12 +31,27 @@ from meme_pipeline.utils.seed import set_seed
 LOGGER = get_logger(__name__)
 
 
-def _loss_fn(logits: torch.Tensor, labels: torch.Tensor, loss_type: str = "cross_entropy") -> torch.Tensor:
+def _compute_class_weights(target_ids: list[int], num_targets: int, device: torch.device) -> torch.Tensor | None:
+    if not target_ids:
+        return None
+    counts = torch.bincount(torch.tensor(target_ids, dtype=torch.long), minlength=num_targets).float()
+    counts = torch.clamp(counts, min=1.0)
+    weights = counts.sum() / (counts * num_targets)
+    return weights.to(device)
+
+
+def _loss_fn(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    loss_type: str = "cross_entropy",
+    class_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
     if loss_type == "focal":
-        ce = nn.functional.cross_entropy(logits, labels, reduction="none")
+        ce = nn.functional.cross_entropy(logits, labels, reduction="none", weight=class_weights)
         pt = torch.exp(-ce)
         return ((1 - pt) ** 2 * ce).mean()
-    return nn.functional.cross_entropy(logits, labels)
+    return nn.functional.cross_entropy(logits, labels, weight=class_weights)
 
 
 @dataclass
@@ -55,15 +71,17 @@ class StageATrainer:
         self.output_dir = Path(config.get("model_output_dir", "outputs/stage_a_model"))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.nlp = load_spacy_or_fail()
+        self.grounder = load_grounder(config)
         set_seed(int(config.get("seed", 42)))
 
     def _prepare_splits(self):
         train_path = self.config.get("train_jsonl")
         val_path = self.config.get("val_jsonl")
+        image_root_dir = self.config.get("image_root_dir")
         if train_path:
-            train_samples = load_raw_samples(train_path)
+            train_samples = load_raw_samples(train_path, image_root_dir=image_root_dir)
             if val_path:
-                val_samples = load_raw_samples(val_path)
+                val_samples = load_raw_samples(val_path, image_root_dir=image_root_dir)
                 return train_samples, val_samples
             train_samples, val_samples, _ = deterministic_split(
                 train_samples,
@@ -82,16 +100,32 @@ class StageATrainer:
             self.config["train_jsonl"],
             min_freq=int(self.config.get("min_target_freq", 1)),
             nlp=self.nlp,
+            image_root_dir=self.config.get("image_root_dir"),
         )
         save_target_vocab(self.output_dir / "target_vocab.json", target_vocab)
         dataset_config = StageADatasetConfig(
             max_candidates=int(self.config.get("max_candidates", 5)),
             drop_unlabeled_candidates=bool(self.config.get("drop_unlabeled_candidates", False)),
+            use_grounding=bool(self.config.get("use_grounding", True)),
         )
-        train_dataset = StageADataset(train_samples, nlp=self.nlp, target_vocab=target_vocab, config=dataset_config)
-        val_dataset = StageADataset(val_samples, nlp=self.nlp, target_vocab=target_vocab, config=dataset_config)
+        train_dataset = StageADataset(
+            train_samples,
+            nlp=self.nlp,
+            target_vocab=target_vocab,
+            config=dataset_config,
+            grounder=self.grounder,
+        )
+        val_dataset = StageADataset(
+            val_samples,
+            nlp=self.nlp,
+            target_vocab=target_vocab,
+            config=dataset_config,
+            grounder=self.grounder,
+        )
         model = StageAMetaphorClassifier(
-            config=StageAModelConfig(**{key: value for key, value in self.config.items() if key in StageAModelConfig.__annotations__}),
+            config=StageAModelConfig(
+                **{key: value for key, value in self.config.items() if key in StageAModelConfig.__annotations__}
+            ),
             num_targets=len(target_vocab),
         )
         train_loader = DataLoader(
@@ -106,24 +140,43 @@ class StageATrainer:
             shuffle=False,
             collate_fn=simple_dict_collator,
         )
-        optimizer = AdamW(model.parameters(), lr=float(self.config.get("learning_rate", 2e-4)), weight_decay=float(self.config.get("weight_decay", 0.01)))
+        optimizer = AdamW(
+            model.parameters(),
+            lr=float(self.config.get("learning_rate", 2e-4)),
+            weight_decay=float(self.config.get("weight_decay", 0.01)),
+        )
         patience = int(self.config.get("patience", 2))
+        grad_accum_steps = max(1, int(self.config.get("grad_accum_steps", 1)))
+        class_weights = None
+        if self.config.get("class_weighting", False):
+            class_weights = _compute_class_weights(
+                [instance.target_id for instance in train_dataset.instances],
+                len(target_vocab),
+                model.device,
+            )
         best_macro_f1 = -1.0
         patience_left = patience
         history: list[dict[str, float]] = []
         for epoch in range(int(self.config.get("num_epochs", 5))):
             model.train()
             total_loss = 0.0
+            optimizer.zero_grad(set_to_none=True)
             for step, batch in enumerate(train_loader, start=1):
                 labels = torch.tensor(batch["target_id"], dtype=torch.long, device=model.device)
                 logits = model(batch)
-                loss = _loss_fn(logits, labels, self.config.get("loss_type", "cross_entropy"))
+                raw_loss = _loss_fn(
+                    logits,
+                    labels,
+                    loss_type=self.config.get("loss_type", "cross_entropy"),
+                    class_weights=class_weights,
+                )
+                loss = raw_loss / grad_accum_steps
                 loss.backward()
-                if step % int(self.config.get("grad_accum_steps", 1)) == 0:
+                if step % grad_accum_steps == 0:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
-                total_loss += float(loss.item())
-            if len(train_loader) % int(self.config.get("grad_accum_steps", 1)) != 0:
+                total_loss += float(raw_loss.item())
+            if len(train_loader) % grad_accum_steps != 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
             metrics = self.evaluate(model, val_loader)
@@ -168,7 +221,9 @@ class StageATrainer:
                 gold.extend(int(item) for item in labels)
                 preds.extend(int(item) for item in pred_ids)
                 topk.extend(indices.tolist())
-                for batch_index, (label, pred, confidence) in enumerate(zip(labels, pred_ids, values[:, 0].tolist())):
+                for batch_index, (label, pred, confidence) in enumerate(
+                    zip(labels, pred_ids, values[:, 0].tolist())
+                ):
                     if int(label) != int(pred):
                         hardest_false_positives.append(
                             {

@@ -2,40 +2,88 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
-class VehicleTargetPair(BaseModel):
-    """Gold metaphor alignment pair."""
+class MetaphorPair(BaseModel):
+    """Gold metaphor supervision pair."""
 
-    vehicle: str
-    target: str
+    metaphor: str
+    meaning: str
 
 
 class RawMemeSample(BaseModel):
-    """Raw JSONL sample contract."""
+    """Primary raw JSONL schema for the meme pipeline."""
 
-    id: str
-    image_path: str
+    category: str = ""
+    img_captions: list[str] = Field(default_factory=list)
+    meme_captions: list[str] = Field(default_factory=list)
     title: str = ""
+    url: str | None = None
+    img_fname: str
+    post_id: str
+    metaphors: list[MetaphorPair] | None = None
     ocr_text: str = ""
-    literal_caption: str = ""
-    gold_meme_caption: str | None = None
-    vehicle_target_pairs: list[VehicleTargetPair] | None = None
+    image_path: str = ""
 
-    @field_validator("title", "ocr_text", "literal_caption", mode="before")
+    @model_validator(mode="before")
+    @classmethod
+    def _upgrade_legacy_keys(cls, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        data = dict(payload)
+        if "post_id" not in data and "id" in data:
+            data["post_id"] = data["id"]
+        if "img_fname" not in data and "image_path" in data:
+            data["img_fname"] = Path(str(data["image_path"])).name
+        if "img_captions" not in data and "literal_caption" in data:
+            literal = data.get("literal_caption") or ""
+            data["img_captions"] = [literal] if literal else []
+        if "meme_captions" not in data and "gold_meme_caption" in data:
+            gold = data.get("gold_meme_caption")
+            data["meme_captions"] = [gold] if gold else []
+        if "metaphors" not in data and "vehicle_target_pairs" in data:
+            metaphors = []
+            for pair in data.get("vehicle_target_pairs") or []:
+                metaphors.append(
+                    {
+                        "metaphor": pair.get("vehicle", ""),
+                        "meaning": pair.get("target", ""),
+                    }
+                )
+            data["metaphors"] = metaphors
+        return data
+
+    @field_validator("title", "ocr_text", mode="before")
     @classmethod
     def _default_empty_string(cls, value: Any) -> str:
         if value is None:
             return ""
         return str(value)
 
+    @field_validator("img_captions", "meme_captions", mode="before")
+    @classmethod
+    def _ensure_list_of_strings(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        return [str(item) for item in value if str(item).strip()]
+
+    @property
+    def id(self) -> str:
+        """Compatibility alias used across the codebase."""
+
+        return self.post_id
+
 
 class CandidateVehicle(BaseModel):
-    """Vehicle extracted from literal caption."""
+    """Vehicle extracted from one image caption."""
 
+    caption_index: int
     surface: str
     normalized: str
     head: str
@@ -52,7 +100,8 @@ class StageAInstance(BaseModel):
     image_path: str
     title: str = ""
     ocr_text: str = ""
-    literal_caption: str = ""
+    img_captions: list[str] = Field(default_factory=list)
+    caption_index: int = 0
     vehicle_surface: str
     vehicle_normalized: str
     vehicle_head: str
@@ -62,11 +111,13 @@ class StageAInstance(BaseModel):
     target_id: int = 0
 
 
-class StageAVehiclePrediction(BaseModel):
-    """Predicted target for one vehicle."""
+class StageAMetaphorMapping(BaseModel):
+    """Predicted Stage A mapping for one vehicle candidate."""
 
     vehicle_surface: str
     vehicle_normalized: str
+    vehicle_head: str = ""
+    caption_index: int = 0
     bbox_xyxy: list[float] | None = None
     grounding_score: float = 0.0
     predicted_target: str
@@ -79,7 +130,7 @@ class StageAInferenceRecord(BaseModel):
     """Stage A JSONL output row."""
 
     id: str
-    vehicles: list[StageAVehiclePrediction] = Field(default_factory=list)
+    metaphor_mappings: list[StageAMetaphorMapping] = Field(default_factory=list)
 
 
 class CaptionCandidate(BaseModel):
@@ -95,6 +146,7 @@ class StageBInferenceRecord(BaseModel):
 
     id: str
     predicted_targets: list[tuple[str, float]] = Field(default_factory=list)
+    predicted_mappings: list[tuple[str, str]] = Field(default_factory=list)
     candidate_captions: list[CaptionCandidate] = Field(default_factory=list)
     best_caption: str = ""
 

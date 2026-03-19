@@ -1,4 +1,4 @@
-from meme_pipeline.stage_a.vehicle_extractor import extract_vehicle_candidates
+from meme_pipeline.stage_a.vehicle_extractor import extract_vehicle_candidates_from_captions
 
 
 class DummyToken:
@@ -19,26 +19,23 @@ class DummySpan:
 
 class DummyDoc:
     def __init__(self, text: str) -> None:
-        self.text = text
         lowered = text.lower()
         self.noun_chunks = []
-        if "confused cat" in lowered:
-            start = lowered.index("a confused cat") if "a confused cat" in lowered else lowered.index("confused cat")
-            surface = text[start : start + (14 if "a confused cat" in lowered else 12)]
-            self.noun_chunks.append(DummySpan(surface, start, start + len(surface), "cat"))
-        if "office worker" in lowered:
-            start = lowered.index("office worker")
-            surface = text[start : start + len("office worker")]
-            self.noun_chunks.append(DummySpan(surface, start, start + len(surface), "worker"))
+        if "a woman" in lowered:
+            start = lowered.index("a woman")
+            self.noun_chunks.append(DummySpan(text[start : start + len("A woman")], start, start + len("A woman"), "woman"))
+        if "engagement ring" in lowered:
+            start = lowered.index("engagement ring")
+            span_text = text[start : start + len("engagement ring")]
+            self.noun_chunks.append(DummySpan(span_text, start, start + len(span_text), "ring"))
         self._tokens = []
-        for word in lowered.split():
-            clean = word.strip(".,")
-            if clean in {"cat", "worker", "desk"}:
-                self._tokens.append(DummyToken(clean, "NOUN", lowered.index(clean)))
-            elif clean in {"confused", "office"}:
-                self._tokens.append(DummyToken(clean, "ADJ", lowered.index(clean)))
-            else:
-                self._tokens.append(DummyToken(clean, "DET", lowered.index(clean)))
+        if "engagement ring" in lowered:
+            self._tokens.append(DummyToken("engagement", "ADJ", lowered.index("engagement")))
+            self._tokens.append(DummyToken("ring", "NOUN", lowered.index("ring")))
+        elif "woman" in lowered:
+            self._tokens.append(DummyToken("woman", "NOUN", lowered.index("woman")))
+        else:
+            self._tokens.append(DummyToken("object", "NOUN", 0))
 
     def __iter__(self):
         return iter(self._tokens)
@@ -49,8 +46,15 @@ class DummyNLP:
         return DummyDoc(text)
 
 
-def test_vehicle_extractor_returns_noun_chunks():
-    candidates = extract_vehicle_candidates("a confused cat near an office worker", DummyNLP())
+def test_vehicle_extractor_uses_img_captions():
+    candidates = extract_vehicle_candidates_from_captions(
+        [
+            "A woman shows off her engagement ring which Thor approves of.",
+            "A couple poses in the top left picture.",
+        ],
+        DummyNLP(),
+    )
     assert candidates
-    assert candidates[0]["normalized"] == "confused cat"
-    assert candidates[1]["head"] == "worker"
+    assert candidates[0]["caption_index"] == 0
+    assert candidates[0]["normalized"] == "woman"
+    assert any(candidate["normalized"].endswith("engagement ring") for candidate in candidates)

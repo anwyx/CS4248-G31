@@ -40,8 +40,11 @@ class GroundingDinoGrounder(Grounder):
             LOGGER.warning("Grounding DINO unavailable: %s", exc)
             return
         try:
-            self._processor = AutoProcessor.from_pretrained(self.model_name)
-            self._model = AutoModelForZeroShotObjectDetection.from_pretrained(self.model_name)
+            self._processor = AutoProcessor.from_pretrained(self.model_name, local_files_only=True)
+            self._model = AutoModelForZeroShotObjectDetection.from_pretrained(
+                self.model_name,
+                local_files_only=True,
+            )
             self._model.eval()
         except Exception as exc:  # pragma: no cover - depends on runtime/model availability
             self._load_error = str(exc)

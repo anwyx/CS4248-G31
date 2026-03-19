@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, random_split
 
@@ -52,10 +53,11 @@ class StageBTrainer:
                 oracle_target_mode=bool(self.config.get("oracle_target_mode", True)),
                 predicted_stage_a_jsonl=self.config.get("predicted_stage_a_jsonl", ""),
             ),
+            image_root_dir=self.config.get("image_root_dir"),
             nlp=self.nlp,
         )
         if len(dataset) == 0:
-            raise ValueError("No Stage B training instances were built. Check gold_meme_caption and target inputs.")
+            raise ValueError("No Stage B training instances were built. Check meme_captions and target inputs.")
         val_jsonl = self.config.get("val_jsonl")
         if val_jsonl:
             train_dataset = dataset
@@ -65,6 +67,7 @@ class StageBTrainer:
                     oracle_target_mode=bool(self.config.get("oracle_target_mode", True)),
                     predicted_stage_a_jsonl=self.config.get("predicted_stage_a_jsonl", ""),
                 ),
+                image_root_dir=self.config.get("image_root_dir"),
                 nlp=self.nlp,
             )
         else:
@@ -78,7 +81,9 @@ class StageBTrainer:
                 val_size = total - train_size
                 train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
         model = StageBCaptionModel(
-            config=StageBModelConfig(**{key: value for key, value in self.config.items() if key in StageBModelConfig.__annotations__})
+            config=StageBModelConfig(
+                **{key: value for key, value in self.config.items() if key in StageBModelConfig.__annotations__}
+            )
         )
         train_loader = DataLoader(
             train_dataset,
@@ -92,34 +97,47 @@ class StageBTrainer:
             shuffle=False,
             collate_fn=simple_dict_collator,
         )
-        optimizer = AdamW(model.parameters(), lr=float(self.config.get("learning_rate", 1e-4)), weight_decay=float(self.config.get("weight_decay", 0.01)))
+        optimizer = AdamW(
+            model.parameters(),
+            lr=float(self.config.get("learning_rate", 1e-4)),
+            weight_decay=float(self.config.get("weight_decay", 0.01)),
+        )
+        grad_accum_steps = max(1, int(self.config.get("grad_accum_steps", 1)))
         history: list[dict[str, float]] = []
         best_val_loss = float("inf")
         for epoch in range(int(self.config.get("num_epochs", 3))):
             model.train()
             running_loss = 0.0
-            for batch in train_loader:
+            optimizer.zero_grad(set_to_none=True)
+            for step, batch in enumerate(train_loader, start=1):
                 prompts = [
                     build_stage_b_generation_prompt(
                         title=title,
                         ocr_text=ocr,
-                        literal_caption=caption,
+                        img_captions=img_captions,
+                        metaphor_mappings=mappings,
                         target_concepts=targets,
                         vehicle_blacklist=vehicles,
                     )
-                    for title, ocr, caption, targets, vehicles in zip(
+                    for title, ocr, img_captions, mappings, targets, vehicles in zip(
                         batch["title"],
                         batch["ocr_text"],
-                        batch["literal_caption"],
+                        batch["img_captions"],
+                        batch["metaphor_mappings"],
                         batch["target_concepts"],
                         batch["vehicle_blacklist"],
                     )
                 ]
-                loss = model.compute_loss(prompts, batch["image_path"], batch["gold_meme_caption"])
+                raw_loss = model.compute_loss(prompts, batch["image_path"], batch["gold_meme_caption"])
+                loss = raw_loss / grad_accum_steps
                 loss.backward()
+                if step % grad_accum_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                running_loss += float(raw_loss.item())
+            if len(train_loader) % grad_accum_steps != 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                running_loss += float(loss.item())
             val_loss = self.evaluate(model, val_loader)
             metrics = {
                 "epoch": epoch + 1,
@@ -144,27 +162,29 @@ class StageBTrainer:
         model.eval()
         total_loss = 0.0
         count = 0
-        for batch in loader:
-            prompts = [
-                build_stage_b_generation_prompt(
-                    title=title,
-                    ocr_text=ocr,
-                    literal_caption=caption,
-                    target_concepts=targets,
-                    vehicle_blacklist=vehicles,
-                )
-                for title, ocr, caption, targets, vehicles in zip(
-                    batch["title"],
-                    batch["ocr_text"],
-                    batch["literal_caption"],
-                    batch["target_concepts"],
-                    batch["vehicle_blacklist"],
-                )
-            ]
-            with __import__("torch").no_grad():
+        with torch.no_grad():
+            for batch in loader:
+                prompts = [
+                    build_stage_b_generation_prompt(
+                        title=title,
+                        ocr_text=ocr,
+                        img_captions=img_captions,
+                        metaphor_mappings=mappings,
+                        target_concepts=targets,
+                        vehicle_blacklist=vehicles,
+                    )
+                    for title, ocr, img_captions, mappings, targets, vehicles in zip(
+                        batch["title"],
+                        batch["ocr_text"],
+                        batch["img_captions"],
+                        batch["metaphor_mappings"],
+                        batch["target_concepts"],
+                        batch["vehicle_blacklist"],
+                    )
+                ]
                 loss = model.compute_loss(prompts, batch["image_path"], batch["gold_meme_caption"])
-            total_loss += float(loss.item())
-            count += 1
+                total_loss += float(loss.item())
+                count += 1
         return total_loss / max(count, 1)
 
 

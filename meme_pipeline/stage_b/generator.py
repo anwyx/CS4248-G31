@@ -20,6 +20,20 @@ def serialize_targets(targets: Sequence[tuple[str, float]] | Sequence[str]) -> l
     return serialized
 
 
+def serialize_mappings(mappings: Sequence[dict[str, Any]] | Sequence[tuple[str, str]]) -> list[tuple[str, str]]:
+    """Serialize Stage A mappings into vehicle -> target tuples."""
+
+    serialized: list[tuple[str, str]] = []
+    for item in mappings:
+        if isinstance(item, tuple):
+            pair = item
+        else:
+            pair = (item.get("vehicle_surface", ""), item.get("predicted_target", ""))
+        if pair[0] and pair[1] and pair[1] != "OTHER" and pair not in serialized:
+            serialized.append(pair)
+    return serialized
+
+
 class StageBGenerator:
     """Generate candidate meme-meaning captions."""
 
@@ -31,12 +45,14 @@ class StageBGenerator:
         *,
         sample: dict[str, Any],
         target_concepts: Sequence[str],
+        metaphor_mappings: Sequence[tuple[str, str]],
         vehicle_blacklist: Sequence[str] | None,
     ) -> str:
         return build_stage_b_generation_prompt(
             title=sample.get("title", ""),
             ocr_text=sample.get("ocr_text", ""),
-            literal_caption=sample.get("literal_caption", ""),
+            img_captions=sample.get("img_captions", []),
+            metaphor_mappings=metaphor_mappings,
             target_concepts=target_concepts,
             vehicle_blacklist=vehicle_blacklist,
         )
@@ -46,6 +62,7 @@ class StageBGenerator:
         sample: dict[str, Any],
         *,
         target_concepts: Sequence[str],
+        metaphor_mappings: Sequence[tuple[str, str]],
         vehicle_blacklist: Sequence[str] | None = None,
         k: int = 5,
         temperature: float = 0.8,
@@ -57,6 +74,7 @@ class StageBGenerator:
         prompt = self._build_prompt(
             sample=sample,
             target_concepts=target_concepts,
+            metaphor_mappings=metaphor_mappings,
             vehicle_blacklist=vehicle_blacklist,
         )
         candidates: list[str] = []
@@ -79,7 +97,12 @@ class StageBGenerator:
         candidates = dedupe_candidates(candidates)
         if candidates:
             return candidates
-        simpler_prompt = self._build_prompt(sample=sample, target_concepts=[], vehicle_blacklist=vehicle_blacklist)
+        simpler_prompt = self._build_prompt(
+            sample=sample,
+            target_concepts=target_concepts,
+            metaphor_mappings=[],
+            vehicle_blacklist=vehicle_blacklist,
+        )
         retry = self.model.generate_one(
             prompt=simpler_prompt,
             image_path=sample["image_path"],

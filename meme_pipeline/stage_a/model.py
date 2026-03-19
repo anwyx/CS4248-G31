@@ -21,8 +21,7 @@ LOGGER = get_logger(__name__)
 class StageAModelConfig:
     """Configuration for Stage A model loading and inference."""
 
-    model_name: str = "Robertp423/Qwen3-VL-4B-Construct"
-    fallback_model_name: str = "Qwen/Qwen3-VL-4B-Instruct"
+    model_name_or_path: str = "models/Qwen3-VL-4B-Instruct"
     device_map: str = "auto"
     dtype: str = "bfloat16"
     freeze_backbone: bool = True
@@ -48,7 +47,7 @@ def resolve_dtype(dtype_name: str) -> torch.dtype:
 
 
 class DummyVisionLanguageBackbone(nn.Module):
-    """Small deterministic fallback used only for local tests or injected runs."""
+    """Small deterministic backbone used only when tests inject it."""
 
     def __init__(self, hidden_size: int = 128) -> None:
         super().__init__()
@@ -81,11 +80,11 @@ class StageAMetaphorClassifier(nn.Module):
         self.num_targets = num_targets
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = resolve_dtype(config.dtype)
-        self.model_name = config.model_name
+        self.model_name_or_path = config.model_name_or_path
         self.processor = processor
         self.backbone = backbone
         if self.backbone is None:
-            self.backbone, self.processor, self.model_name = self._load_backbone()
+            self.backbone, self.processor = self._load_backbone()
         self.hidden_size = hidden_size or self._infer_hidden_size()
         self.classifier = StageAClassifierHead(self.hidden_size, num_targets, config.classifier_dropout)
         self.classifier.to(self.device)
@@ -99,27 +98,52 @@ class StageAMetaphorClassifier(nn.Module):
             raise RuntimeError(
                 "transformers>=4.57.0 with Qwen3-VL support is required to load the backbone."
             ) from exc
-        for model_name in [self.config.model_name, self.config.fallback_model_name]:
-            try:
-                processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model_path = Path(self.config.model_name_or_path)
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Qwen model folder not found: {model_path}. "
+                "Place Qwen/Qwen3-VL-4B-Instruct at the configured local path."
+            )
+        try:
+            processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
+            adapter_config_path = model_path / "adapter_config.json"
+            if adapter_config_path.exists():
+                import json
+                from peft import PeftModel
+
+                with adapter_config_path.open("r", encoding="utf-8") as handle:
+                    adapter_config = json.load(handle)
+                base_model_path = Path(adapter_config["base_model_name_or_path"])
+                if not base_model_path.exists():
+                    raise FileNotFoundError(
+                        f"Base model referenced by adapter does not exist locally: {base_model_path}"
+                    )
                 backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                    model_name,
+                    str(base_model_path),
                     torch_dtype=self.dtype,
                     device_map=self.config.device_map,
                     output_hidden_states=True,
                     trust_remote_code=True,
+                    local_files_only=True,
                 )
-                if self.config.freeze_backbone:
-                    for parameter in backbone.parameters():
-                        parameter.requires_grad = False
-                backbone = self._maybe_apply_lora(backbone)
-                LOGGER.info("Loaded Stage A backbone: %s", model_name)
-                return backbone, processor, model_name
-            except Exception as exc:  # pragma: no cover - runtime/model dependent
-                LOGGER.warning("Failed to load model %s: %s", model_name, exc)
-        raise RuntimeError(
-            f"Unable to load primary model {self.config.model_name} or fallback {self.config.fallback_model_name}."
-        )
+                backbone = PeftModel.from_pretrained(backbone, str(model_path), local_files_only=True)
+            else:
+                backbone = Qwen3VLForConditionalGeneration.from_pretrained(
+                    str(model_path),
+                    torch_dtype=self.dtype,
+                    device_map=self.config.device_map,
+                    output_hidden_states=True,
+                    trust_remote_code=True,
+                    local_files_only=True,
+                )
+        except Exception as exc:  # pragma: no cover - runtime/model dependent
+            raise RuntimeError(f"Failed to load Qwen/Qwen3-VL-4B-Instruct from {model_path}: {exc}") from exc
+        if self.config.freeze_backbone:
+            for parameter in backbone.parameters():
+                parameter.requires_grad = False
+        backbone = self._maybe_apply_lora(backbone)
+        LOGGER.info("Loaded Stage A backbone from %s", model_path)
+        return backbone, processor
 
     def _maybe_apply_lora(self, backbone: nn.Module):
         if not self.config.use_lora:
@@ -147,12 +171,12 @@ class StageAMetaphorClassifier(nn.Module):
 
     def _infer_hidden_size(self) -> int:
         if hasattr(self.backbone, "config"):
-            for attr in ("hidden_size", "text_config", "d_model"):
-                value = getattr(self.backbone.config, attr, None)
-                if isinstance(value, int):
-                    return value
-                if hasattr(value, "hidden_size"):
-                    return int(value.hidden_size)
+            hidden_size = getattr(self.backbone.config, "hidden_size", None)
+            if isinstance(hidden_size, int):
+                return hidden_size
+            text_config = getattr(self.backbone.config, "text_config", None)
+            if hasattr(text_config, "hidden_size"):
+                return int(text_config.hidden_size)
         if isinstance(self.backbone, DummyVisionLanguageBackbone):
             return self.backbone.hidden_size
         return 1024
@@ -168,7 +192,7 @@ class StageAMetaphorClassifier(nn.Module):
                 build_stage_a_classification_prompt(
                     title=batch.get("title", [""])[index] if batch.get("title") else "",
                     ocr_text=batch.get("ocr_text", [""])[index] if batch.get("ocr_text") else "",
-                    literal_caption=batch.get("literal_caption", [""])[index] if batch.get("literal_caption") else "",
+                    img_captions=batch.get("img_captions", [[]])[index] if batch.get("img_captions") else [],
                     vehicle_surface=batch["vehicle_surface"][index],
                     vehicle_normalized=batch["vehicle_normalized"][index],
                     vehicle_head=batch["vehicle_head"][index],
@@ -191,10 +215,7 @@ class StageAMetaphorClassifier(nn.Module):
         )
         prepared: dict[str, Any] = {}
         for key, value in inputs.items():
-            if hasattr(value, "to"):
-                prepared[key] = value.to(self.device)
-            else:
-                prepared[key] = value
+            prepared[key] = value.to(self.device) if hasattr(value, "to") else value
         outputs = self.backbone(**prepared, output_hidden_states=True, return_dict=True)
         hidden = outputs.hidden_states[-1]
         attention_mask = prepared.get("attention_mask")
@@ -220,15 +241,16 @@ class StageAMetaphorClassifier(nn.Module):
         return torch.softmax(logits, dim=-1)
 
     def save(self, output_dir: str | Path) -> None:
-        """Save classifier head and any adapter/model assets."""
+        """Save Qwen model+processor into one folder and head separately."""
 
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        qwen_dir = output_dir / "qwen_model"
+        qwen_dir.mkdir(parents=True, exist_ok=True)
         torch.save(self.classifier.state_dict(), output_dir / "classifier_head.pt")
         if hasattr(self.processor, "save_pretrained"):
-            self.processor.save_pretrained(output_dir / "processor")
+            self.processor.save_pretrained(qwen_dir)
         if hasattr(self.backbone, "save_pretrained"):
-            self.backbone.save_pretrained(output_dir / "backbone")
+            self.backbone.save_pretrained(qwen_dir)
 
     def load_classifier_head(self, path: str | Path) -> None:
         """Load classifier head weights."""

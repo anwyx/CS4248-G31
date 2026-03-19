@@ -20,8 +20,7 @@ LOGGER = get_logger(__name__)
 class StageBModelConfig:
     """Configuration for Stage B model loading."""
 
-    model_name: str = "Robertp423/Qwen3-VL-4B-Construct"
-    fallback_model_name: str = "Qwen/Qwen3-VL-4B-Instruct"
+    model_name_or_path: str = "models/Qwen3-VL-4B-Instruct"
     device_map: str = "auto"
     dtype: str = "bfloat16"
     use_lora: bool = True
@@ -32,7 +31,7 @@ class StageBModelConfig:
 
 
 class DummyCaptionBackbone(nn.Module):
-    """Simple deterministic caption fallback for tests."""
+    """Simple deterministic caption fallback used only when tests inject it."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -40,11 +39,11 @@ class DummyCaptionBackbone(nn.Module):
 
     def heuristic_generate(self, prompt: str) -> str:
         prompt_lower = prompt.lower()
-        if "predicted target concepts" in prompt_lower:
-            tail = prompt.split("Predicted target concepts:", maxsplit=1)[-1]
-            targets = [line.strip("- ").strip() for line in tail.splitlines() if line.strip().startswith("-")]
-            if targets:
-                return f"The meme conveys {', '.join(targets[:2])} through a relatable reaction."
+        if "predicted metaphor mappings" in prompt_lower:
+            tail = prompt.split("Predicted metaphor mappings:", maxsplit=1)[-1]
+            mappings = [line.strip("- ").strip() for line in tail.splitlines() if "->" in line]
+            if mappings:
+                return f"The meme conveys {mappings[0].split('->')[-1].strip()} in a proud, validated way."
         return "The meme conveys a relatable emotional reaction under social pressure."
 
 
@@ -64,9 +63,9 @@ class StageBCaptionModel(nn.Module):
         self.dtype = resolve_dtype(config.dtype)
         self.backbone = backbone
         self.processor = processor
-        self.model_name = config.model_name
+        self.model_name_or_path = config.model_name_or_path
         if self.backbone is None:
-            self.backbone, self.processor, self.model_name = self._load_backbone()
+            self.backbone, self.processor = self._load_backbone()
         if isinstance(self.backbone, nn.Module):
             self.backbone.to(self.device)
 
@@ -77,23 +76,47 @@ class StageBCaptionModel(nn.Module):
             raise RuntimeError(
                 "transformers>=4.57.0 with Qwen3-VL support is required to load the Stage B backbone."
             ) from exc
-        for model_name in [self.config.model_name, self.config.fallback_model_name]:
-            try:
-                processor = AutoProcessor.from_pretrained(model_name, trust_remote_code=True)
+        model_path = Path(self.config.model_name_or_path)
+        if not model_path.exists():
+            raise FileNotFoundError(
+                f"Qwen model folder not found: {model_path}. "
+                "Place Qwen/Qwen3-VL-4B-Instruct at the configured local path."
+            )
+        try:
+            processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
+            adapter_config_path = model_path / "adapter_config.json"
+            if adapter_config_path.exists():
+                import json
+                from peft import PeftModel
+
+                with adapter_config_path.open("r", encoding="utf-8") as handle:
+                    adapter_config = json.load(handle)
+                base_model_path = Path(adapter_config["base_model_name_or_path"])
+                if not base_model_path.exists():
+                    raise FileNotFoundError(
+                        f"Base model referenced by adapter does not exist locally: {base_model_path}"
+                    )
                 backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                    model_name,
+                    str(base_model_path),
                     torch_dtype=self.dtype,
                     device_map=self.config.device_map,
                     trust_remote_code=True,
+                    local_files_only=True,
                 )
-                backbone = self._maybe_apply_lora(backbone)
-                LOGGER.info("Loaded Stage B backbone: %s", model_name)
-                return backbone, processor, model_name
-            except Exception as exc:  # pragma: no cover - runtime/model dependent
-                LOGGER.warning("Failed to load model %s: %s", model_name, exc)
-        raise RuntimeError(
-            f"Unable to load primary model {self.config.model_name} or fallback {self.config.fallback_model_name}."
-        )
+                backbone = PeftModel.from_pretrained(backbone, str(model_path), local_files_only=True)
+            else:
+                backbone = Qwen3VLForConditionalGeneration.from_pretrained(
+                    str(model_path),
+                    torch_dtype=self.dtype,
+                    device_map=self.config.device_map,
+                    trust_remote_code=True,
+                    local_files_only=True,
+                )
+        except Exception as exc:  # pragma: no cover - runtime/model dependent
+            raise RuntimeError(f"Failed to load Qwen/Qwen3-VL-4B-Instruct from {model_path}: {exc}") from exc
+        backbone = self._maybe_apply_lora(backbone)
+        LOGGER.info("Loaded Stage B backbone from %s", model_path)
+        return backbone, processor
 
     def _maybe_apply_lora(self, backbone):
         if not self.config.use_lora:
@@ -107,6 +130,7 @@ class StageBCaptionModel(nn.Module):
         module_names = {name.rsplit(".", 1)[-1] for name, _ in backbone.named_modules()}
         active_modules = [name for name in target_modules if name in module_names]
         if not active_modules:
+            LOGGER.warning("No configured LoRA target modules found in backbone; skipping LoRA.")
             return backbone
         lora_config = LoraConfig(
             task_type=TaskType.CAUSAL_LM,
@@ -122,8 +146,8 @@ class StageBCaptionModel(nn.Module):
 
         if isinstance(self.backbone, DummyCaptionBackbone):
             return self.backbone.placeholder.sum() * 0
-        full_texts = [f"{prompt}\nAnswer: {target}" for prompt, target in zip(prompts, targets)]
-        prompt_only = [f"{prompt}\nAnswer:" for prompt in prompts]
+        full_texts = [f"{prompt}\n{target}" for prompt, target in zip(prompts, targets)]
+        prompt_only = list(prompts)
         images = [load_image(path) for path in image_paths]
         full_inputs = self.processor(images=images, text=full_texts, return_tensors="pt", padding=True, truncation=True)
         prompt_inputs = self.processor(images=images, text=prompt_only, return_tensors="pt", padding=True, truncation=True)
@@ -146,7 +170,7 @@ class StageBCaptionModel(nn.Module):
         temperature: float,
         top_p: float,
     ) -> str:
-        """Generate one caption candidate."""
+        """Generate one caption candidate and decode only new tokens."""
 
         if isinstance(self.backbone, DummyCaptionBackbone):
             return self.backbone.heuristic_generate(prompt)
@@ -160,20 +184,21 @@ class StageBCaptionModel(nn.Module):
             temperature=temperature,
             top_p=top_p,
         )
+        prompt_length = int(prepared["input_ids"].shape[1])
+        generated_only = outputs[:, prompt_length:]
         if hasattr(self.processor, "batch_decode"):
-            decoded = self.processor.batch_decode(outputs, skip_special_tokens=True)[0]
+            decoded = self.processor.batch_decode(generated_only, skip_special_tokens=True)[0]
         else:  # pragma: no cover - processor dependent
-            decoded = self.processor.decode(outputs[0], skip_special_tokens=True)
-        if "Answer:" in decoded:
-            decoded = decoded.split("Answer:", maxsplit=1)[-1]
+            decoded = self.processor.decode(generated_only[0], skip_special_tokens=True)
         return decoded.strip()
 
     def save(self, output_dir: str | Path) -> None:
-        """Persist model and processor."""
+        """Persist model and processor to one local folder."""
 
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        qwen_dir = output_dir / "qwen_model"
+        qwen_dir.mkdir(parents=True, exist_ok=True)
         if hasattr(self.processor, "save_pretrained"):
-            self.processor.save_pretrained(output_dir / "processor")
+            self.processor.save_pretrained(qwen_dir)
         if hasattr(self.backbone, "save_pretrained"):
-            self.backbone.save_pretrained(output_dir / "backbone")
+            self.backbone.save_pretrained(qwen_dir)

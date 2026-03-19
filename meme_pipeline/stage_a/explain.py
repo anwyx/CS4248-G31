@@ -19,7 +19,7 @@ def explain_prediction(
     prompt = build_stage_a_debug_generation_prompt(
         title=sample.get("title", ""),
         ocr_text=sample.get("ocr_text", ""),
-        literal_caption=sample.get("literal_caption", ""),
+        img_captions=sample.get("img_captions", []),
         vehicle_surface=sample["vehicle_surface"],
         predicted_target=predicted_target,
     )
@@ -38,7 +38,7 @@ def explain_prediction(
     if not rationale:
         rationale = (
             f"The vehicle visually stands in for {predicted_target}, "
-            "based on the surrounding title, OCR, and literal scene context."
+            "based on the meme image, image captions, OCR, and title context."
         )
     return {
         "vehicle": sample["vehicle_surface"],

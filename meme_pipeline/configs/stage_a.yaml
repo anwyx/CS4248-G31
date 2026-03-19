@@ -1,5 +1,6 @@
-model_name: "Robertp423/Qwen3-VL-4B-Construct"
-fallback_model_name: "Qwen/Qwen3-VL-4B-Instruct"
+model_name_or_path: "models/Qwen3-VL-4B-Instruct"
+grounding_model_name_or_path: "models/grounding_dino"
+image_root_dir: "data/images"
 model_output_dir: "outputs/stage_a_model"
 device_map: "auto"
 dtype: "bfloat16"
@@ -19,9 +20,6 @@ lora_target_modules:
 classifier_dropout: 0.1
 max_candidates: 5
 use_grounding: true
-grounding_backend: "grounding_dino"
-grounding_model_name: "IDEA-Research/grounding-dino-base"
-grounding_fallback_model_name: "yolo_world/l"
 grounding_box_threshold: 0.30
 grounding_text_threshold: 0.25
 grounding_crop_dir: "outputs/grounding_crops"
@@ -30,9 +28,9 @@ confidence_threshold: 0.35
 drop_unlabeled_candidates: false
 loss_type: "cross_entropy"
 class_weighting: false
-train_jsonl: ""
-val_jsonl: ""
-test_jsonl: ""
+train_jsonl: "data/train.jsonl"
+val_jsonl: "data/val.jsonl"
+test_jsonl: "data/test.jsonl"
 train_split_ratio: 0.8
 eval_split_ratio: 0.1
 train_batch_size: 2
