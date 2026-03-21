@@ -3,6 +3,8 @@ image_root_dir: "data/images"
 model_output_dir: "outputs/stage_b_model"
 device_map: "auto"
 dtype: "bfloat16"
+load_in_4bit: true
+vision_max_pixels: 401408  # 512 * 28 * 28 — caps patches to ≤512 on T4
 use_lora: true
 lora_r: 16
 lora_alpha: 32

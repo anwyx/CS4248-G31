@@ -24,6 +24,8 @@ class StageAModelConfig:
     model_name_or_path: str = "models/Qwen3-VL-4B-Instruct"
     device_map: str = "auto"
     dtype: str = "bfloat16"
+    load_in_4bit: bool = False
+    vision_max_pixels: int = 512 * 28 * 28  # cap image patches; limits vision encoder attention to O(512²)
     freeze_backbone: bool = True
     use_lora: bool = True
     lora_r: int = 16
@@ -87,9 +89,13 @@ class StageAMetaphorClassifier(nn.Module):
             self.backbone, self.processor = self._load_backbone()
         self.hidden_size = hidden_size or self._infer_hidden_size()
         self.classifier = StageAClassifierHead(self.hidden_size, num_targets, config.classifier_dropout)
-        self.classifier.to(self.device)
-        if isinstance(self.backbone, nn.Module):
+        self.classifier.to(device=self.device, dtype=self.dtype)
+        if isinstance(self.backbone, nn.Module) and not self.config.device_map:
             self.backbone.to(self.device)
+        # Per-instance caches: image_path -> PIL Image, instance_id -> formatted text.
+        # Populated on first forward pass; subsequent epochs/val steps are free.
+        self._image_cache: dict[str, Any] = {}
+        self._text_cache: dict[str, str] = {}
 
     def _load_backbone(self):
         try:
@@ -105,7 +111,31 @@ class StageAMetaphorClassifier(nn.Module):
                 "Place Qwen/Qwen3-VL-4B-Instruct at the configured local path."
             )
         try:
-            processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
+            processor = AutoProcessor.from_pretrained(
+                str(model_path),
+                min_pixels=4 * 28 * 28,
+                max_pixels=self.config.vision_max_pixels,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            quantization_config = None
+            if self.config.load_in_4bit:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            load_kwargs: dict[str, Any] = dict(
+                torch_dtype=self.dtype,
+                device_map=self.config.device_map,
+                output_hidden_states=True,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            if quantization_config is not None:
+                load_kwargs["quantization_config"] = quantization_config
             adapter_config_path = model_path / "adapter_config.json"
             if adapter_config_path.exists():
                 import json
@@ -118,27 +148,16 @@ class StageAMetaphorClassifier(nn.Module):
                     raise FileNotFoundError(
                         f"Base model referenced by adapter does not exist locally: {base_model_path}"
                     )
-                backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                    str(base_model_path),
-                    torch_dtype=self.dtype,
-                    device_map=self.config.device_map,
-                    output_hidden_states=True,
-                    trust_remote_code=True,
-                    local_files_only=True,
-                )
+                backbone = Qwen3VLForConditionalGeneration.from_pretrained(str(base_model_path), **load_kwargs)
                 backbone = PeftModel.from_pretrained(backbone, str(model_path), local_files_only=True)
             else:
-                backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                    str(model_path),
-                    torch_dtype=self.dtype,
-                    device_map=self.config.device_map,
-                    output_hidden_states=True,
-                    trust_remote_code=True,
-                    local_files_only=True,
-                )
+                backbone = Qwen3VLForConditionalGeneration.from_pretrained(str(model_path), **load_kwargs)
         except Exception as exc:  # pragma: no cover - runtime/model dependent
             raise RuntimeError(f"Failed to load Qwen/Qwen3-VL-4B-Instruct from {model_path}: {exc}") from exc
-        if self.config.freeze_backbone:
+        if self.config.load_in_4bit and self.config.use_lora:
+            from peft import prepare_model_for_kbit_training
+            backbone = prepare_model_for_kbit_training(backbone)
+        elif self.config.freeze_backbone:
             for parameter in backbone.parameters():
                 parameter.requires_grad = False
         backbone = self._maybe_apply_lora(backbone)
@@ -205,10 +224,24 @@ class StageAMetaphorClassifier(nn.Module):
         prompts = self.build_prompt(batch)
         if isinstance(self.backbone, DummyVisionLanguageBackbone):
             return self.backbone.encode_prompt(prompts).to(self.device)
-        images = [load_image(path) for path in batch["image_path"]]
+        # Load images via cache — avoids re-reading from disk on every forward pass.
+        images = []
+        for path in batch["image_path"]:
+            if path not in self._image_cache:
+                self._image_cache[path] = load_image(path)
+            images.append(self._image_cache[path])
+        # Format text via cache keyed by instance id — apply_chat_template is
+        # expensive (patch-count computation) so we compute it once per instance.
+        instance_ids = batch.get("id", [None] * len(prompts))
+        formatted_texts = []
+        for instance_id, image, prompt in zip(instance_ids, images, prompts):
+            if instance_id not in self._text_cache:
+                messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+                self._text_cache[instance_id] = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            formatted_texts.append(self._text_cache[instance_id])
         inputs = self.processor(
             images=images,
-            text=prompts,
+            text=formatted_texts,
             return_tensors="pt",
             padding=True,
             truncation=True,
@@ -216,7 +249,13 @@ class StageAMetaphorClassifier(nn.Module):
         prepared: dict[str, Any] = {}
         for key, value in inputs.items():
             prepared[key] = value.to(self.device) if hasattr(value, "to") else value
-        outputs = self.backbone(**prepared, output_hidden_states=True, return_dict=True)
+        # Skip gradient tracking for the backbone when it has no trainable
+        # parameters (freeze_backbone=True, use_lora=False). This avoids
+        # storing large intermediate activations for the image tokens.
+        backbone_needs_grad = any(p.requires_grad for p in self.backbone.parameters())
+        ctx = torch.enable_grad() if backbone_needs_grad else torch.no_grad()
+        with ctx:
+            outputs = self.backbone(**prepared, output_hidden_states=True, return_dict=True)
         hidden = outputs.hidden_states[-1]
         attention_mask = prepared.get("attention_mask")
         if attention_mask is None:
@@ -250,6 +289,11 @@ class StageAMetaphorClassifier(nn.Module):
         if hasattr(self.processor, "save_pretrained"):
             self.processor.save_pretrained(qwen_dir)
         if hasattr(self.backbone, "save_pretrained"):
+            # output_hidden_states=True passed to from_pretrained leaks into
+            # generation_config; transformers rejects it on save unless
+            # return_dict_in_generate is also True. Clear it before saving.
+            if hasattr(self.backbone, "generation_config"):
+                self.backbone.generation_config.output_hidden_states = False
             self.backbone.save_pretrained(qwen_dir)
 
     def load_classifier_head(self, path: str | Path) -> None:

@@ -23,6 +23,8 @@ class StageBModelConfig:
     model_name_or_path: str = "models/Qwen3-VL-4B-Instruct"
     device_map: str = "auto"
     dtype: str = "bfloat16"
+    load_in_4bit: bool = False
+    vision_max_pixels: int = 512 * 28 * 28  # cap image patches; limits vision encoder attention to O(512²)
     use_lora: bool = True
     lora_r: int = 16
     lora_alpha: int = 32
@@ -66,7 +68,7 @@ class StageBCaptionModel(nn.Module):
         self.model_name_or_path = config.model_name_or_path
         if self.backbone is None:
             self.backbone, self.processor = self._load_backbone()
-        if isinstance(self.backbone, nn.Module):
+        if isinstance(self.backbone, nn.Module) and not self.config.device_map:
             self.backbone.to(self.device)
 
     def _load_backbone(self):
@@ -83,7 +85,30 @@ class StageBCaptionModel(nn.Module):
                 "Place Qwen/Qwen3-VL-4B-Instruct at the configured local path."
             )
         try:
-            processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
+            processor = AutoProcessor.from_pretrained(
+                str(model_path),
+                min_pixels=4 * 28 * 28,
+                max_pixels=self.config.vision_max_pixels,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            quantization_config = None
+            if self.config.load_in_4bit:
+                from transformers import BitsAndBytesConfig
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                )
+            load_kwargs: dict[str, Any] = dict(
+                torch_dtype=self.dtype,
+                device_map=self.config.device_map,
+                trust_remote_code=True,
+                local_files_only=True,
+            )
+            if quantization_config is not None:
+                load_kwargs["quantization_config"] = quantization_config
             adapter_config_path = model_path / "adapter_config.json"
             if adapter_config_path.exists():
                 import json
@@ -96,24 +121,15 @@ class StageBCaptionModel(nn.Module):
                     raise FileNotFoundError(
                         f"Base model referenced by adapter does not exist locally: {base_model_path}"
                     )
-                backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                    str(base_model_path),
-                    torch_dtype=self.dtype,
-                    device_map=self.config.device_map,
-                    trust_remote_code=True,
-                    local_files_only=True,
-                )
+                backbone = Qwen3VLForConditionalGeneration.from_pretrained(str(base_model_path), **load_kwargs)
                 backbone = PeftModel.from_pretrained(backbone, str(model_path), local_files_only=True)
             else:
-                backbone = Qwen3VLForConditionalGeneration.from_pretrained(
-                    str(model_path),
-                    torch_dtype=self.dtype,
-                    device_map=self.config.device_map,
-                    trust_remote_code=True,
-                    local_files_only=True,
-                )
+                backbone = Qwen3VLForConditionalGeneration.from_pretrained(str(model_path), **load_kwargs)
         except Exception as exc:  # pragma: no cover - runtime/model dependent
             raise RuntimeError(f"Failed to load Qwen/Qwen3-VL-4B-Instruct from {model_path}: {exc}") from exc
+        if self.config.load_in_4bit and self.config.use_lora:
+            from peft import prepare_model_for_kbit_training
+            backbone = prepare_model_for_kbit_training(backbone)
         backbone = self._maybe_apply_lora(backbone)
         LOGGER.info("Loaded Stage B backbone from %s", model_path)
         return backbone, processor
@@ -146,9 +162,14 @@ class StageBCaptionModel(nn.Module):
 
         if isinstance(self.backbone, DummyCaptionBackbone):
             return self.backbone.placeholder.sum() * 0
-        full_texts = [f"{prompt}\n{target}" for prompt, target in zip(prompts, targets)]
-        prompt_only = list(prompts)
         images = [load_image(path) for path in image_paths]
+
+        def _apply_template(image: Any, text: str, *, generation_prompt: bool = False) -> str:
+            messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": text}]}]
+            return self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=generation_prompt)
+
+        full_texts = [_apply_template(img, f"{p}\n{t}") for img, p, t in zip(images, prompts, targets)]
+        prompt_only = [_apply_template(img, p) for img, p in zip(images, prompts)]
         full_inputs = self.processor(images=images, text=full_texts, return_tensors="pt", padding=True, truncation=True)
         prompt_inputs = self.processor(images=images, text=prompt_only, return_tensors="pt", padding=True, truncation=True)
         full_inputs = {key: value.to(self.device) if hasattr(value, "to") else value for key, value in full_inputs.items()}
@@ -175,7 +196,9 @@ class StageBCaptionModel(nn.Module):
         if isinstance(self.backbone, DummyCaptionBackbone):
             return self.backbone.heuristic_generate(prompt)
         image = load_image(image_path)
-        inputs = self.processor(images=[image], text=[prompt], return_tensors="pt", padding=True, truncation=True)
+        messages = [{"role": "user", "content": [{"type": "image", "image": image}, {"type": "text", "text": prompt}]}]
+        formatted_text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        inputs = self.processor(images=[image], text=[formatted_text], return_tensors="pt", padding=True, truncation=True)
         prepared = {key: value.to(self.device) if hasattr(value, "to") else value for key, value in inputs.items()}
         outputs = self.backbone.generate(
             **prepared,

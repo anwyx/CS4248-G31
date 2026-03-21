@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from meme_pipeline.data.collators import simple_dict_collator
 from meme_pipeline.data.io import deterministic_split, load_config, load_raw_samples
@@ -157,11 +158,14 @@ class StageATrainer:
         best_macro_f1 = -1.0
         patience_left = patience
         history: list[dict[str, float]] = []
-        for epoch in range(int(self.config.get("num_epochs", 5))):
+        num_epochs = int(self.config.get("num_epochs", 5))
+        epoch_bar = tqdm(range(num_epochs), desc="Epochs", unit="epoch")
+        for epoch in epoch_bar:
             model.train()
             total_loss = 0.0
             optimizer.zero_grad(set_to_none=True)
-            for step, batch in enumerate(train_loader, start=1):
+            train_bar = tqdm(enumerate(train_loader, start=1), total=len(train_loader), desc=f"Train E{epoch+1}", leave=False, unit="batch")
+            for step, batch in train_bar:
                 labels = torch.tensor(batch["target_id"], dtype=torch.long, device=model.device)
                 logits = model(batch)
                 raw_loss = _loss_fn(
@@ -176,6 +180,7 @@ class StageATrainer:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                 total_loss += float(raw_loss.item())
+                train_bar.set_postfix(loss=f"{raw_loss.item():.4f}")
             if len(train_loader) % grad_accum_steps != 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -183,6 +188,7 @@ class StageATrainer:
             metrics["train_loss"] = total_loss / max(len(train_loader), 1)
             metrics["epoch"] = epoch + 1
             history.append(metrics)
+            epoch_bar.set_postfix(train_loss=f"{metrics['train_loss']:.4f}", macro_f1=f"{metrics['macro_f1']:.4f}")
             LOGGER.info("Epoch %s metrics: %s", epoch + 1, metrics)
             if metrics["macro_f1"] > best_macro_f1:
                 best_macro_f1 = metrics["macro_f1"]
@@ -213,7 +219,7 @@ class StageATrainer:
         topk: list[list[int]] = []
         hardest_false_positives: list[dict[str, Any]] = []
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="Validating", leave=False, unit="batch"):
                 labels = batch["target_id"]
                 probs = model.predict_proba(batch)
                 values, indices = torch.topk(probs, k=min(3, probs.size(-1)), dim=-1)

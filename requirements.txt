@@ -1,19 +1,23 @@
-torch
-torchvision
+# torch and torchvision are pre-installed on Colab with CUDA support.
+# Uncomment the lines below only if running outside Colab (CPU-only).
+# torch
+# torchvision
+
 transformers>=4.57.0
-accelerate
-peft
-bitsandbytes
+accelerate>=1.0.0
+peft>=0.13.0
+bitsandbytes>=0.43.0
 datasets
+# Use headless OpenCV (no GUI dependencies) for Colab/server environments
+opencv-python-headless
 pillow
-opencv-python
 numpy
 pandas
 pyyaml
-spacy
+spacy>=3.0.0
 easyocr
 scikit-learn
 tqdm
-pydantic
+pydantic>=2.0.0
 sentencepiece
 safetensors

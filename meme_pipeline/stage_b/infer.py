@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 from meme_pipeline.data.io import load_config, load_raw_samples, read_jsonl, write_jsonl
 from meme_pipeline.data.schemas import CaptionCandidate, StageBInferenceRecord
 from meme_pipeline.stage_b.generator import StageBGenerator, serialize_mappings, serialize_targets
@@ -100,7 +102,10 @@ class StageBInferencePipeline:
 
         samples = load_raw_samples(input_path, image_root_dir=self.config.get("image_root_dir"))
         stage_a_map = load_stage_a_output_map(stage_a_outputs) if stage_a_outputs else {}
-        outputs = [self.predict_sample(sample, stage_a_map.get(sample.post_id)) for sample in samples]
+        outputs = [
+            self.predict_sample(sample, stage_a_map.get(sample.post_id))
+            for sample in tqdm(samples, desc="Stage B inference", unit="sample")
+        ]
         write_jsonl(output_path, outputs)
 
 

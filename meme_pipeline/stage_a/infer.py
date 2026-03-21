@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from tqdm import tqdm
 
 from meme_pipeline.data.io import load_config, load_raw_samples, write_jsonl
 from meme_pipeline.data.schemas import StageAInferenceRecord
@@ -119,7 +120,7 @@ class StageAInferencePipeline:
         """Run Stage A inference over a JSONL file."""
 
         samples = load_raw_samples(input_path, image_root_dir=self.config.get("image_root_dir"))
-        records = [self.predict_sample(sample) for sample in samples]
+        records = [self.predict_sample(sample) for sample in tqdm(samples, desc="Stage A inference", unit="sample")]
         write_jsonl(output_path, records)
 
 

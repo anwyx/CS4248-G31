@@ -10,6 +10,7 @@ from typing import Any
 import torch
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
 from meme_pipeline.data.collators import simple_dict_collator
 from meme_pipeline.data.io import load_config
@@ -105,11 +106,14 @@ class StageBTrainer:
         grad_accum_steps = max(1, int(self.config.get("grad_accum_steps", 1)))
         history: list[dict[str, float]] = []
         best_val_loss = float("inf")
-        for epoch in range(int(self.config.get("num_epochs", 3))):
+        num_epochs = int(self.config.get("num_epochs", 3))
+        epoch_bar = tqdm(range(num_epochs), desc="Epochs", unit="epoch")
+        for epoch in epoch_bar:
             model.train()
             running_loss = 0.0
             optimizer.zero_grad(set_to_none=True)
-            for step, batch in enumerate(train_loader, start=1):
+            train_bar = tqdm(enumerate(train_loader, start=1), total=len(train_loader), desc=f"Train E{epoch+1}", leave=False, unit="batch")
+            for step, batch in train_bar:
                 prompts = [
                     build_stage_b_generation_prompt(
                         title=title,
@@ -135,6 +139,7 @@ class StageBTrainer:
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                 running_loss += float(raw_loss.item())
+                train_bar.set_postfix(loss=f"{raw_loss.item():.4f}")
             if len(train_loader) % grad_accum_steps != 0:
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -145,6 +150,7 @@ class StageBTrainer:
                 "val_loss": val_loss,
             }
             history.append(metrics)
+            epoch_bar.set_postfix(train_loss=f"{metrics['train_loss']:.4f}", val_loss=f"{val_loss:.4f}")
             LOGGER.info("Epoch %s metrics: %s", epoch + 1, metrics)
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -163,7 +169,7 @@ class StageBTrainer:
         total_loss = 0.0
         count = 0
         with torch.no_grad():
-            for batch in loader:
+            for batch in tqdm(loader, desc="Validating", leave=False, unit="batch"):
                 prompts = [
                     build_stage_b_generation_prompt(
                         title=title,
